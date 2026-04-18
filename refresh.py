@@ -52,7 +52,6 @@ def load_progress() -> Dict[str, Any]:
                 return json.load(f)
     except Exception as e:
         logging.warning(e)
-        pass
     return {"processed_urls": [], "collected_products": 0}
 
 
@@ -66,7 +65,6 @@ def save_progress(processed_urls: List[str], collected_products: int):
             }, f)
     except Exception as e:
         logging.warning(e)
-        pass
 
 
 def get_cookie(proxy: Optional[str]) -> Optional[str]:
@@ -80,7 +78,7 @@ def get_cookie(proxy: Optional[str]) -> Optional[str]:
                 proxy_settings: ProxySettings = {"server": server, "username": username, "password": password}
         except Exception as e:
             logging.warning(e)
-            proxy_settings = None
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"], proxy=proxy_settings)
@@ -110,12 +108,16 @@ async def refresh_cookie():
 async def resolve_hash(session: AsyncSession, token: str) -> Optional[str]:
     for attempt in range(MAX_RETRIES):
         try:
-            r = await session.post("https://www.idealo.fr/ipc/prg", data={"value": token}, timeout=60, proxy=PROXY)
+            r = await session.post(
+                "https://www.idealo.fr/ipc/prg",
+                data={"value": token},
+                timeout=60,
+                proxy=PROXY
+            )
             if r.status_code == 200:
                 return str(r.url)
         except Exception as e:
             logging.warning(e)
-            pass
         await asyncio.sleep(2 ** attempt)
     return None
 
@@ -125,11 +127,25 @@ async def fetch_urls(session: AsyncSession, page_index: int) -> List[str]:
         for attempt in range(MAX_RETRIES):
             try:
                 await asyncio.sleep(random.uniform(0.3, 1.0))
-                r = await session.get(API_URL, params={"locale": "fr_FR", "pageIndex": page_index, "itemsPerPage": 60, "itemStates": "BARGAIN"}, timeout=60, proxy=PROXY)
+                r = await session.get(
+                    API_URL,
+                    params={
+                        "locale": "fr_FR",
+                        "pageIndex": page_index,
+                        "itemsPerPage": 60,
+                        "itemStates": "BARGAIN"
+                    },
+                    timeout=60,
+                    proxy=PROXY
+                )
                 r.raise_for_status()
                 data = r.json()
                 items = data.get("items", [])
+
+                logging.info(f"Page {page_index}: {len(items)} items")
+
                 urls, hashes = [], []
+
                 for item in items:
                     href = item.get("href")
                     if not href:
@@ -138,13 +154,17 @@ async def fetch_urls(session: AsyncSession, page_index: int) -> List[str]:
                         urls.append(href)
                     else:
                         hashes.append(href)
+
                 if hashes:
                     resolved = await asyncio.gather(*[resolve_hash(session, h) for h in hashes])
                     urls.extend([u for u in resolved if u])
+
                 return urls
+
             except Exception as e:
                 logging.warning(e)
                 await asyncio.sleep(2 ** attempt)
+
         return []
 
 
@@ -153,8 +173,13 @@ async def collect_urls() -> List[str]:
     async with AsyncSession(headers=HEADERS_API, impersonate="chrome142", http_version="v2", **params) as session:
         tasks = [fetch_urls(session, i) for i in range(TOTAL_PAGES)]
         results = await asyncio.gather(*tasks)
+
     all_urls = [u for batch in results for u in batch]
-    return list(dict.fromkeys(all_urls))
+
+    unique_urls = list(dict.fromkeys(all_urls))
+    logging.info(f"Collected URLs: {len(unique_urls)} (raw: {len(all_urls)})")
+
+    return unique_urls
 
 
 class IDEALOScraper:
@@ -163,12 +188,17 @@ class IDEALOScraper:
         self.url_queue = asyncio.Queue()
         self.data_queue = asyncio.Queue(maxsize=1000)
         self.semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+
         self.progress = load_progress()
         self.progress_lock = Lock()
+
         processed = set(self.progress.get("processed_urls", []))
         self.processed_urls = list(processed)
         self.collected_count = self.progress.get("collected_products", 0)
+
         self.remaining_urls = [u for u in urls if u not in processed]
+
+        self.seen_products = set()
 
     async def fetch(self, session: AsyncSession, url: str) -> Optional[str]:
         for attempt in range(MAX_RETRIES):
@@ -176,39 +206,48 @@ class IDEALOScraper:
                 async with self.semaphore:
                     await asyncio.sleep(random.uniform(0.2, 0.6))
                     r = await session.get(url, headers=self.headers, timeout=45, proxy=PROXY)
+
                     if r.status_code in (401, 403):
                         cookie = await refresh_cookie()
                         if cookie:
                             self.headers["Cookie"] = cookie
                         continue
+
                     if r.status_code < 400:
                         return r.text
+
             except Exception as e:
                 logging.warning(e)
-                pass
+
             await asyncio.sleep(2 ** attempt)
+
         return None
 
     @staticmethod
     def parse(html: str) -> Optional[Dict[str, Any]]:
         try:
             soup = BeautifulSoup(html, "lxml")
+
             price_el = soup.find("div", attrs={"class": "productOffers-listItemOfferShippingDetails"})
             price = None
+
             if price_el:
                 price_clean = price_el.text.strip().replace("€ livraison incl.", "")
-                price_clean = re.sub(r"[^\d.,]", "", price_clean)
-                price_clean = price_clean.replace(",", ".")
+                price_clean = re.sub(r"[^\d.,]", "", price_clean).replace(",", ".")
                 if price_clean:
                     price = float(price_clean)
 
             scripts = soup.find_all("script", type="application/ld+json")
+
             for s in scripts:
                 if not s.string:
                     continue
-                data = json.loads(s.string.strip())
+
+                data = json.loads(str(s.string).strip())
+
                 if isinstance(data, dict) and "offers" in data:
                     name = data.get("name")
+
                     if name and price is not None:
                         return {
                             "product_name": name,
@@ -216,65 +255,91 @@ class IDEALOScraper:
                             "product_gtin": data.get("gtin", ""),
                             "product_url": data.get("url", "")
                         }
+
         except Exception as e:
             logging.warning(e)
-            return None
+
         return None
 
     async def worker(self, session: AsyncSession):
         while True:
             url = await self.url_queue.get()
+
             if url is None:
                 self.url_queue.task_done()
                 break
+
             try:
                 html = await self.fetch(session, url)
+
                 async with self.progress_lock:
                     self.processed_urls.append(url)
+
                 if html:
                     data = self.parse(html)
+
                     if data:
-                        await self.data_queue.put(data)
-                        async with self.progress_lock:
-                            self.collected_count += 1
+                        key = data.get("product_gtin") or data.get("product_url")
+
+                        if key and key not in self.seen_products:
+                            self.seen_products.add(key)
+
+                            await self.data_queue.put(data)
+
+                            async with self.progress_lock:
+                                self.collected_count += 1
+
                 if len(self.processed_urls) % 50 == 0:
                     async with self.progress_lock:
                         save_progress(self.processed_urls, self.collected_count)
+
             finally:
                 self.url_queue.task_done()
 
     async def saver(self):
         while True:
             item = await self.data_queue.get()
+
             if item is None:
                 self.data_queue.task_done()
                 break
+
             async with file_lock:
                 with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
                     f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
             self.data_queue.task_done()
 
     async def run(self):
         params = {"allow_redirects": True, "timeout": 60}
+
         async with AsyncSession(impersonate="chrome142", http_version="v2", **params) as session:
             for url in self.remaining_urls:
                 await self.url_queue.put(url)
+
             workers = [asyncio.create_task(self.worker(session)) for _ in range(CONCURRENT_REQUESTS)]
             saver_task = asyncio.create_task(self.saver())
+
             await self.url_queue.join()
+
             for _ in workers:
                 await self.url_queue.put(None)
+
             await asyncio.gather(*workers)
+
             await self.data_queue.put(None)
             await self.data_queue.join()
             await saver_task
+
             async with self.progress_lock:
                 save_progress(self.processed_urls, self.collected_count)
 
 
 def main():
     urls = asyncio.run(collect_urls())
+
     cookie = get_cookie(PROXY) or ""
+
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -292,6 +357,7 @@ def main():
         "Upgrade-Insecure-Requests": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
     }
+
     scraper = IDEALOScraper(urls, headers)
     asyncio.run(scraper.run())
 
