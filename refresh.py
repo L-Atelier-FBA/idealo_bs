@@ -191,6 +191,7 @@ class IDEALOScraper:
 
         self.progress = load_progress()
         self.progress_lock = Lock()
+        self.seen_lock = Lock()
 
         processed = set(self.progress.get("processed_urls", []))
         self.processed_urls = list(processed)
@@ -279,13 +280,21 @@ class IDEALOScraper:
                     data = self.parse(html)
 
                     if data:
-                        key = data.get("product_gtin") or data.get("product_url")
-
-                        if key and key not in self.seen_products:
-                            self.seen_products.add(key)
-
+                        url = data.get("product_url", "")
+                    
+                        match = re.search(r"/prix/(\d+)", url)
+                        product_id = match.group(1) if match else None
+                    
+                        key = product_id or data.get("product_gtin") or url
+                    
+                        if key:
+                            async with self.seen_lock:
+                                if key in self.seen_products:
+                                    continue
+                                self.seen_products.add(key)
+                    
                             await self.data_queue.put(data)
-
+                    
                             async with self.progress_lock:
                                 self.collected_count += 1
 
