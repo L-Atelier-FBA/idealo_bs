@@ -18,7 +18,7 @@ load_dotenv()
 API_URL = "https://www.idealo.fr/csr/api/v2/modules/dealsResult"
 TOTAL_PAGES = 67
 MAX_RETRIES = 3
-CONCURRENT_REQUESTS = 25
+CONCURRENT_REQUESTS = 5
 OUTPUT_FILE = "products.jsonl"
 PROGRESS_FILE = "progress.json"
 PROXY = os.getenv("PROXY")
